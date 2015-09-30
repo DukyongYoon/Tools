@@ -1,0 +1,142 @@
+<OMOP CDM 맞춤 CERT 알고리듬 소스 코드>
+
+
+
+--=============================================================
+--CERT ALGORITHM IN OMOP CDM. 2015.09
+--=============================================================
+ ATC 코드를 기준으로 타겟약물을 투여한 입원환자의 약물투여 전후비교
+ 숫자형 검사수치 MAX값 t-test
+ 비정상 유무 McNemar test
+--------------------------------------------------------------------------
+-- 1. Target Drug Exposure Table 생성: MED_VISIT
+--------------------------------------------------------------------------
+
+IF OBJECT_ID('MED_VISIT','U') IS NOT NULL
+DROP TABLE MED_VISIT
+
+WITH
+atc (atc_concept_id) 
+AS (SELECT concept_id FROM concept WHERE concept_code='Target ATC 코드입력')
+,--ATC 코드에대한 OMOP Concept ID 확인
+
+drug (drug_concept_id) 
+AS (SELECT descendant_concept_id 
+FROM concept_ancestor 
+WHERE ancestor_concept_id IN (SELECT atc_concept_id FROM atc))
+,--해당 ATC 코드의 Child drug의 OMOP Concept ID 추출
+
+medication (person_id,visit_occurrence_id,drug_exposure_start_date,drug_exposure_end_date)
+AS (SELECT person_id,visit_occurrence_id,drug_exposure_start_date,drug_exposure_end_date
+FROM drug_exposure
+WHERE drug_type_concept_id='38000180' 
+AND drug_concept_id IN (SELECT drug_concept_id FROM drug))
+,--Target drug을 처방받은 입원환자(omop_concept_id=38000180)의 약물 노출기록 추출
+
+visit (visit_occurrence_id,person_id,visit_start_date,visit_end_date)
+AS (SELECT visit_occurrence_id,person_id,visit_start_date,visit_end_date
+FROM visit_occurrence
+WHERE place_of_service_concept_id='9201' 
+AND visit_occurrence_id IN (SELECT visit_occurrence_id FROM medication))
+,--약물 처방을 받은 입원(omop_concept_id=9201)기간 기록 추출
+
+med_visit (person_id,visit_occurrence_id,visit_start_date,visit_end_date,drug_exposure_first_date,drug_exposure_last_date)
+AS (SELECT A.person_id,A.visit_occurrence_id,A.visit_start_date,A.visit_end_date,MIN(B.drug_exposure_start_date),
+MAX(B.drug_exposure_end_date)
+FROM visit A INNER JOIN medication B
+ON A.visit_occurrence_id=B.visit_occurrence_id
+GROUP BY A.person_id,A.visit_occurrence_id,A.visit_start_date,A.visit_end_date) 
+--약물처방을 받은 환자의 입원 기간 내에서 최초처방일, 최후노출일 기록
+
+SELECT person_id,visit_occurrence_id,visit_start_date,visit_end_date,drug_exposure_first_date,drug_exposure_last_date,
+predate=DATEDIFF(D,visit_start_date,drug_exposure_first_date),
+postdate=CASE WHEN (visit_end_date<drug_exposure_last_date) 
+THEN DATEDIFF(D,drug_exposure_first_date,visit_end_date) 
+ELSE DATEDIFF(D,drug_exposure_first_date,drug_exposure_last_date) END
+INTO MED_VISIT
+FROM med_visit 
+ORDER BY person_id,visit_start_date,visit_end_date
+
+
+--------------------------------------------------------------------------
+-- 2. Target Lab-test 포함Table 생성: LAB_BEFAFT
+--------------------------------------------------------------------------
+
+IF OBJECT_ID('LAB_BEFAFT','U') IS NOT NULL
+DROP TABLE LAB_BEFAFT
+
+WITH
+labtest (observation_id,person_id,observation_concept_id,visit_occurrence_id,
+observation_date,value_as_number,range_low,range_high,fg)
+AS (SELECT observation_id,person_id,observation_concept_id,visit_occurrence_id,
+observation_date,value_as_number,range_low,range_high,
+CASE WHEN(value_as_number BETWEEN range_low AND range_high) THEN 'N'
+WHEN(value_as_number > range_high) THEN 'H'
+WHEN(value_as_number < range_low) THEN 'L' END
+FROM observation
+WHERE visit_occurrence_id IN (SELECT visit_occurrence_id FROM sooyeon_cert.dbo.med_visit)
+AND observation_concept_id IN ('검사OMOP Concept ID 1','검사OMOP Concept ID 2','...... (반복)'))
+,--환자의 Target 검사결과 추출
+
+before (visit_occurrence_id,observation_date,value_as_number,fg)
+AS (SELECT A.visit_occurrence_id,observation_date,value_as_number,fg
+FROM labtest A, sooyeon_cert.dbo.MED_VISIT B
+WHERE A.visit_occurrence_id=B.visit_occurrence_id AND A.observation_date <= B.drug_exposure_first_date)
+,--약물투여전 입원기간 중의 검사수치 테이블
+
+after (visit_occurrence_id,observation_date,value_as_number,fg)
+AS (SELECT A.visit_occurrence_id,observation_date,value_as_number,fg
+FROM labtest A, sooyeon_cert.dbo.MED_VISIT B
+WHERE A.visit_occurrence_id=B.visit_occurrence_id AND A.observation_date > B.drug_exposure_first_date)
+--약물투여후 입원기간 중의 검사수치 테이블
+
+SELECT A.visit_occurrence_id,
+CAST(MAX(A.value_as_number) AS FLOAT) before_max_value,
+CAST(MAX(B.value_as_number) AS FLOAT) after_max_value,
+befor_ubnormalyn= CASE WHEN MAX(A.fg)='N' THEN 0 ELSE 1 END,
+after_ubnormalyn= CASE WHEN MAX(B.fg)='N' THEN 0 ELSE 1 END
+INTO LAB_BEFAFT
+FROM before A, after B
+WHERE A.visit_occurrence_id=B.visit_occurrence_id
+AND A.value_as_number IS NOT NULL AND B.value_as_number IS NOT NULL
+GROUP BY A.visit_occurrence_id
+
+
+--------------------------------------------------------------------------
+-- 3. Mcnemar's 분석용Table 생성: McnemarCount
+--------------------------------------------------------------------------
+
+IF OBJECT_ID('McnemarCount','U') IS NOT NULL
+DROP TABLE McnemarCount
+
+SELECT befor_ubnormalyn, after_ubnormalyn, count(*) frequency
+INTO McnemarCount 
+FROM lab_befaft 
+GROUP BY befor_ubnormalyn, after_ubnormalyn
+
+
+
+--------------------------------------------------------------------------
+-- R을이용하여통계분석수행
+--------------------------------------------------------------------------
+
+--1. t-test
+install.packages("RODBC")
+library(RODBC)
+
+mydata=sqlQuery(conn<-odbcConnect('odbc 연결설정'),
+                "select before_max_value, after_max_value, befor_ubnormalyn,after_ubnormalyn from lab_befaft")
+odbcClose(conn)
+t.test(mydata$before_max_value, mydata$after_max_value,paired=TRUE, conf.level=0.95)
+
+
+--2. McNemar's Test
+count.data<-sqlQuery(conn<-odbcConnect('odbc 연결설정'),
+              "select * from McnemarCount")
+odbcClose(conn)
+test.data<-matrix(a[,3], ncol=2,byrow=T, dimnames=list("before" = c("normal","ubnormal"),
+                                                    "after" = c("normal","ubnormal")))
+mcnemar.test(test.data)
+
+
+
