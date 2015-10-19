@@ -1,7 +1,6 @@
 <OMOP CDM 맞춤 CERT 알고리듬 소스 코드>
 
 
-
 --=============================================================
 --CERT ALGORITHM IN OMOP CDM. 2015.09
 --=============================================================
@@ -134,9 +133,8 @@ t.test(mydata$before_max_value, mydata$after_max_value,paired=TRUE, conf.level=0
 count.data<-sqlQuery(conn<-odbcConnect('odbc 연결설정'),
               "select * from McnemarCount")
 odbcClose(conn)
-test.data<-matrix(a[,3], ncol=2,byrow=T, dimnames=list("before" = c("normal","ubnormal"),
+test.data<-matrix(count.data[,3], ncol=2,byrow=T, dimnames=list("before" = c("normal","ubnormal"),
                                                     "after" = c("normal","ubnormal")))
 mcnemar.test(test.data)
-
 
 
